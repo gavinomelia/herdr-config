@@ -1,0 +1,491 @@
+#!/usr/bin/env bash
+# Rails worktrees in herdr, each with its own databases and browser URL. Settings live in
+# ~/.config/herdr/wt.env (see wt.env.example).
+#
+#   wt new [target] [base]  Create a worktree workspace: a "code" tab (Claude, editor, terminal) and a
+#                           "server" tab that runs `wt setup` and then `wt serve`. The target is a
+#                           branch name, a Linear issue (ABC-1234: its branch, and the agent starts by
+#                           reading the issue), or a PR (pr:1234: its branch, and the agent starts by
+#                           reading the PR)
+#   wt setup                Bootstrap the checkout you're in (one made from herdr's sidebar, too)
+#   wt serve                Run the app at its portless URL (works in the main checkout too)
+#   wt open                 Open this checkout's URL in the browser
+#   wt ls                   Every checkout with its PR, CI, uncommitted files, distance from main,
+#                           unpushed commits, and age
+#   wt scratch              Open a workspace on the main checkout with the code layout and no server,
+#                           for questions and one-off changes that don't need a branch
+#   wt layout               Split the current pane into the code layout (Claude, editor, terminal)
+#   wt review [base]        Split the focused pane and start Codex reviewing this branch against base
+#                           (default main), read-only
+#   wt rm [--force] <branch>  Close the workspace, remove the checkout, drop its databases
+#   wt prune                Remove clean worktrees whose PR merged and delete their branches; offer to
+#                           remove ones whose PR closed or that have no PR and sat idle for 14 days;
+#                           delete branches without a worktree whose PR merged; then `wt gc`
+#   wt gc [--dry-run]       Drop every database no checkout uses, however its checkout was removed
+#   wt snapshot             Refresh the idle dev-DB copy new worktrees clone from (main server
+#                           stopped); without one, new worktrees need the dev DB idle instead
+#
+#   WT_AGENT=codex wt new|layout  Put Codex in the code layout instead of Claude
+set -euo pipefail
+
+die() { echo "wt: $*" >&2; exit 1; }
+
+HERE=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
+WT_CONFIG=${WT_CONFIG:-$HOME/.config/herdr/wt.env}
+[ -f "$WT_CONFIG" ] || die "no settings at $WT_CONFIG; copy $HERE/wt.env.example there and fill it in"
+# shellcheck source=/dev/null
+. "$WT_CONFIG"
+
+MAIN=${WT_MAIN:?set WT_MAIN in $WT_CONFIG}
+DB_PREFIX=${WT_DB_PREFIX:?set WT_DB_PREFIX in $WT_CONFIG}
+APP=${WT_APP:?set WT_APP in $WT_CONFIG}
+TICKET_PREFIX=${WT_TICKET_PREFIX:-}
+AUTO_LOGIN_EMAIL=${WT_AUTO_LOGIN_EMAIL:-}
+PROCFILE=${WT_PROCFILE:-$HERE/app/Procfile}
+AUTO_LOGIN_SOURCE=${WT_AUTO_LOGIN_SOURCE:-$HERE/app/worktree_auto_login.rb}
+AUTO_LOGIN_INITIALIZER=config/initializers/worktree_auto_login.rb
+EDITOR_COMMAND=${WT_EDITOR_COMMAND:-nvim}
+IDLE_DAYS=${WT_IDLE_DAYS:-14}
+
+AGENT=${WT_AGENT:-claude}
+
+REVIEW_PROMPT='Review this branch against %s: the committed diff from the merge base plus any uncommitted changes. Another agent wrote it. Apply AGENTS.md and the docs/conventions files that match the changed paths. Do not edit files; running targeted specs is fine. Report findings ranked by severity, each with file:line, the failing scenario, and a suggested fix. If nothing is worth fixing, say so plainly.'
+ISSUE_PROMPT='Read Linear issue %s with get_issue and list_comments. Summarize what it asks for and any open questions, then wait for instructions.'
+PR_PROMPT='This checkout is PR #%s, here for review. Read it with gh pr view %s and its diff against its base. Summarize what it changes, then wait for instructions.'
+
+# Branch -> identifier-safe suffix, short enough for "<DB_PREFIX>_test_<slug><TEST_ENV_NUMBER>"
+db_slug() { local s=${1,,}; s=${s//[^a-z0-9]/_}; echo "${s:0:30}"; }
+
+checkout_root() { git rev-parse --show-toplevel 2>/dev/null || die "not inside a git checkout"; }
+
+db_exists() { [ "$(psql -d postgres -Atc "SELECT 1 FROM pg_database WHERE datname = '$1'")" = 1 ]; }
+
+SNAPSHOT_DB=${DB_PREFIX}_wt_snapshot
+
+# path<TAB>branch for every checkout, the main one first; branch is empty for a detached checkout
+worktrees() {
+  git -C "$MAIN" worktree list --porcelain |
+    awk '/^worktree /{path=substr($0,10); branch=""} /^branch /{branch=substr($0,19)} /^$/{print path "\t" branch}'
+}
+
+# On btrfs, file_copy_method = clone makes copying the multi-GB dev database near instant.
+# Postgres refuses to copy a database that has connections, so this fails while it's in use.
+clone_db() {
+  local source=$1 target=$2
+  echo "Cloning $source into $target..."
+  psql -d postgres -q -v ON_ERROR_STOP=1 \
+    -c "SET file_copy_method = clone" \
+    -c "CREATE DATABASE \"$target\" TEMPLATE \"$source\" STRATEGY = FILE_COPY"
+}
+
+# The snapshot is never connected to, so worktrees can clone it while the main server runs
+cmd_snapshot() {
+  psql -d postgres -q -c "DROP DATABASE IF EXISTS \"$SNAPSHOT_DB\""
+  clone_db "${DB_PREFIX}_development" "$SNAPSHOT_DB" ||
+    die "stop the main checkout's server, worker, and console so the dev database is idle, then rerun wt snapshot"
+}
+
+worktree_dev_db() {
+  local db=$1 source=$SNAPSHOT_DB
+  db_exists "$db" && return
+  db_exists "$source" || source=${DB_PREFIX}_development
+  clone_db "$source" "$db" ||
+    die "couldn't clone $source while it's in use. Stop the main checkout's server once and run wt snapshot, then rerun wt setup"
+}
+
+# The main checkout's defaults (with their turbo_tests copies), the snapshot, and whatever each
+# linked checkout's .env_overrides.rb names. ui-qa's checkouts write one too.
+live_db_names() {
+  local paths path
+  paths=$(git -C "$MAIN" worktree list --porcelain | sed -n 's/^worktree //p')
+  [ -n "$paths" ] || return 1
+  printf '%s\n' "${DB_PREFIX}_development" "${DB_PREFIX}_test" "$SNAPSHOT_DB"
+  while read -r path; do
+    sed -nE "s/^ENV\['DATABASE(_TEST)?_NAME'\] \|\|= '([^']+)'.*/\2/p" "$path/.env_overrides.rb" 2>/dev/null || true
+  done <<<"$paths"
+}
+
+# Removing a checkout from herdr's sidebar, from git, or from another tool skips `wt rm`, so this
+# sweeps up after all of them. A name plus digits is one of turbo_tests' copies of that database.
+cmd_gc() {
+  local dry= live db
+  [ "${1:-}" = --dry-run ] && dry=1
+  [ -n "$dry" ] || git -C "$MAIN" worktree prune
+  live=$(live_db_names) || die "couldn't list the checkouts, so no database is safe to drop"
+  while read -r db; do
+    [ -n "$db" ] || continue
+    grep -qxF -e "$db" -e "${db%"${db##*[!0-9]}"}" <<<"$live" && continue
+    if [ -n "$dry" ]; then
+      echo "would drop $db"
+    else
+      dropdb --force "$db" && echo "Dropped $db"
+    fi
+  done < <(psql -d postgres -Atc "SELECT datname FROM pg_database WHERE datname LIKE '${DB_PREFIX}\_%' ORDER BY 1")
+}
+
+# The exclude file is shared by every worktree, so the initializer can never be committed
+install_auto_login() {
+  local exclude
+  [ -n "$AUTO_LOGIN_EMAIL" ] || return 0
+  exclude=$(git rev-parse --git-common-dir)/info/exclude
+  grep -qxF "/$AUTO_LOGIN_INITIALIZER" "$exclude" 2>/dev/null || echo "/$AUTO_LOGIN_INITIALIZER" >>"$exclude"
+  cp -n "$AUTO_LOGIN_SOURCE" "$AUTO_LOGIN_INITIALIZER"
+}
+
+cmd_setup() {
+  local root branch slug
+  root=$(checkout_root)
+  [ "$root" != "$MAIN" ] || die "setup is for linked worktrees; the main checkout is already set up"
+  branch=$(git -C "$root" branch --show-current)
+  slug=$(db_slug "$branch")
+  cd "$root"
+
+  for key in "$MAIN"/config/credentials/*.key; do
+    [ -e "config/credentials/${key##*/}" ] || ln -s "$key" config/credentials/
+  done
+  if [ -f "$MAIN/.mise.local.toml" ] && [ ! -f .mise.local.toml ]; then
+    cp "$MAIN/.mise.local.toml" .
+    mise trust --quiet . 2>/dev/null || true
+  fi
+
+  if [ ! -f .env_overrides.rb ]; then
+    cat >.env_overrides.rb <<RUBY
+# Written by wt setup: this worktree's own databases, so migrations and specs don't collide
+ENV['DATABASE_NAME'] ||= '${DB_PREFIX}_${slug}'
+ENV['DATABASE_TEST_NAME'] ||= '${DB_PREFIX}_test_${slug}'
+# Rails' default ".localhost" allows one subdomain level; portless serves <branch>.${APP}.localhost
+ENV['ADDITIONAL_HOST'] ||= '.${APP}.localhost'
+ENV['WT_AUTO_LOGIN_EMAIL'] ||= '${AUTO_LOGIN_EMAIL}'
+RUBY
+  fi
+
+  install_auto_login
+
+  git submodule update --init --quiet
+
+  # Reflink copies are free on btrfs and turn the installs into quick no-ops
+  [ -d node_modules ] || cp -a --reflink=auto "$MAIN/node_modules" .
+  cp -an --reflink=auto "$MAIN/app/assets/builds/." app/assets/builds/
+  bundle install --quiet
+  yarn install
+
+  worktree_dev_db "${DB_PREFIX}_${slug}"
+  bin/rails db:migrate
+  RAILS_ENV=test bin/rails db:prepare
+  # turbo_tests runs a process per CPU, each against its own "<test db><TEST_ENV_NUMBER>"
+  bin/rails parallel:create parallel:load_schema
+
+  echo "Ready: $(portless get "$APP")"
+}
+
+cmd_serve() {
+  local root
+  root=$(checkout_root)
+  portless doctor 2>&1 | grep -q "Proxy is responding" ||
+    echo "wt: the portless proxy isn't running; start it once with: sudo portless service install" >&2
+  # gems are per Ruby version, so a Ruby bump leaves the checkout's Ruby without foreman
+  cd "$root"
+  gem list foreman -i --silent || { gem install foreman && mise reshim; }
+  export WT_APP=$APP
+  exec foreman start -f "$PROCFILE" -d "$root"
+}
+
+cmd_open() {
+  cd "$(checkout_root)"
+  xdg-open "$(portless get "$APP")" >/dev/null 2>&1 &
+}
+
+# branch<TAB>number<TAB>state<TAB>head sha for recent PRs, newest first. State is OPEN, DRAFT,
+# MERGED, or CLOSED.
+pr_index() {
+  (cd "$MAIN" && gh pr list --state all --limit 300 --json number,state,isDraft,headRefName,headRefOid \
+    --jq '.[] | [.headRefName, .number, (if .isDraft and .state == "OPEN" then "DRAFT" else .state end), .headRefOid] | @tsv')
+}
+
+# branch<TAB>pass|fail|running for open PRs. Asking for checks on every PR takes ten times as long.
+ci_index() {
+  (cd "$MAIN" && gh pr list --state open --limit 100 --json headRefName,statusCheckRollup \
+    --jq '.[] | [.headRefName, ((.statusCheckRollup // []) | map(.conclusion // .state // "") |
+      if length == 0 then "-"
+      elif any(.[]; . == "FAILURE" or . == "ERROR" or . == "TIMED_OUT" or . == "CANCELLED" or . == "ACTION_REQUIRED" or . == "STARTUP_FAILURE") then "fail"
+      elif any(.[]; . == "" or . == "PENDING" or . == "EXPECTED") then "running"
+      else "pass" end)] | @tsv')
+}
+
+row_for() { [ -n "$1" ] && awk -F'\t' -v b="$1" '$1 == b { print; exit }' <<<"$2"; }
+
+cmd_ls() {
+  local prs ci path branch pr number state pr_column checks changed counts unpushed age
+  prs=$(pr_index)
+  ci=$(ci_index)
+  {
+    printf 'WORKTREE\tPR\tCI\tCHANGED\tMAIN\tUNPUSHED\tLAST COMMIT\n'
+    while IFS=$'\t' read -r path branch; do
+      [ -d "$path" ] || continue
+      pr_column=-
+      if pr=$(row_for "$branch" "$prs") && [ -n "$pr" ]; then
+        IFS=$'\t' read -r _ number state _ <<<"$pr"
+        pr_column="#$number ${state,,}"
+      fi
+      checks=$(row_for "$branch" "$ci" | cut -f2) || true
+      changed=$(git -C "$path" status --porcelain | wc -l)
+      counts=$(git -C "$path" rev-list --left-right --count main...HEAD 2>/dev/null) || counts="? ?"
+      unpushed=$(git -C "$path" rev-list --count '@{u}..HEAD' 2>/dev/null) || unpushed="no upstream"
+      age=$(git -C "$path" log -1 --format=%cr)
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${branch:-$(basename "$path") (detached)}" "$pr_column" \
+        "${checks:--}" "$changed" "↓${counts%%[[:space:]]*} ↑${counts##*[[:space:]]}" "$unpushed" "$age"
+    done < <(worktrees)
+  } | column -t -s $'\t'
+}
+
+# Agent names must be short and unique, so use the ticket number when there is one
+agent_name() {
+  if [ -n "$TICKET_PREFIX" ] && [[ $1 =~ ^(${TICKET_PREFIX,,}-[0-9]+) ]]; then echo "${BASH_REMATCH[1]}"; else echo "$1"; fi
+}
+
+# Linear's branch names carry the issue title, so "abc-2558-add-operating-hours" reads as
+# "add operating hours". The ticket number shows under it as the agent name.
+workspace_label() {
+  if [ -n "$TICKET_PREFIX" ] && [[ $1 =~ ^${TICKET_PREFIX,,}-[0-9]+-(.+)$ ]]; then echo "${BASH_REMATCH[1]//-/ }"; else echo "$1"; fi
+}
+
+# Omarchy's `hdl cx` with the sides flipped: the agent left (70%), editor right (30%),
+# terminal along the bottom (15%)
+dev_layout() {
+  local ai_pane=$1 dir=$2 name=$3 prompt=${4:-} editor_pane
+  herdr pane split "$ai_pane" --direction down --ratio 0.85 --cwd "$dir" --no-focus >/dev/null
+  editor_pane=$(herdr pane split "$ai_pane" --direction right --ratio 0.7 --cwd "$dir" --no-focus |
+    jq -r '.result.pane.pane_id')
+  herdr pane run "$editor_pane" "$EDITOR_COMMAND" >/dev/null
+  start_agent "$name" "$AGENT" "$ai_pane" ${prompt:+"$prompt"}
+}
+
+# Returns agent_not_ready while the agent asks whether to trust the new folder; that's expected
+start_agent() {
+  local name=$1 kind=$2 pane=$3
+  shift 3
+  local args=("$@")
+  [ "$kind" = claude ] && args=(--permission-mode auto "${args[@]}")
+  herdr agent start "$name" --kind "$kind" --pane "$pane" -- "${args[@]}" >/dev/null 2>&1 || true
+}
+
+cmd_review() {
+  local base=${1:-main} root pane
+  root=$(checkout_root)
+  pane=$(herdr pane split "${HERDR_ACTIVE_PANE_ID:-${HERDR_PANE_ID:?run wt review inside herdr}}" --direction right --ratio 0.5 --cwd "$root" | jq -r '.result.pane.pane_id')
+  start_agent "review-$(agent_name "$(git -C "$root" branch --show-current)")" codex "$pane" --approve-for-me "$(printf "$REVIEW_PROMPT" "$base")"
+}
+
+cmd_layout() {
+  local root
+  [ -n "${HERDR_PANE_ID:-}" ] || die "run wt layout inside a herdr pane"
+  root=$(checkout_root)
+  herdr tab rename "$HERDR_TAB_ID" code >/dev/null
+  dev_layout "$HERDR_PANE_ID" "$root" "$(agent_name "$(git -C "$root" branch --show-current)")"
+}
+
+# Headless Claude reads Linear through the connector this account already has, so no API key
+linear_branch() {
+  echo "Looking up $1 in Linear..." >&2
+  (cd "$HOME" && claude -p --model haiku --allowedTools mcp__claude_ai_Linear__get_issue --output-format json \
+    "Use the Linear get_issue tool for $1. Reply with ONLY a JSON object {\"branch\": <its gitBranchName>} and nothing else." \
+    </dev/null 2>/dev/null) | jq -r '.result // empty' | grep -o '{.*}' | jq -r '.branch // empty'
+}
+
+# Turns what was typed into the branch, workspace label, agent name, and first prompt for cmd_new
+resolve_target() {
+  local target=$1 json number
+  prompt=
+  if [[ $target =~ ^(pr:|#)([0-9]+)$ ]]; then
+    number=${BASH_REMATCH[2]}
+    json=$(cd "$MAIN" && gh pr view "$number" --json headRefName,title,isCrossRepository) || die "couldn't find PR #$number"
+    [ "$(jq -r .isCrossRepository <<<"$json")" = false ] || die "PR #$number comes from a fork"
+    branch=$(jq -r .headRefName <<<"$json")
+    label="PR $number: $(jq -r .title <<<"$json")"
+    name="pr-$number"
+    prompt=$(printf "$PR_PROMPT" "$number" "$number")
+  elif [ -n "$TICKET_PREFIX" ] && [[ ${target^^} =~ ^${TICKET_PREFIX^^}-[0-9]+$ ]]; then
+    branch=$(linear_branch "${target^^}")
+    [ -n "$branch" ] || die "couldn't look up ${target^^} in Linear; pass its branch name instead"
+    label=$(workspace_label "$branch")
+    name=$(agent_name "$branch")
+    prompt=$(printf "$ISSUE_PROMPT" "${target^^}")
+  else
+    branch=$target
+    label=$(workspace_label "$branch")
+    name=$(agent_name "$branch")
+  fi
+}
+
+# A branch someone already pushed (a teammate's ticket, a PR) is checked out rather than recreated
+fetch_branch() {
+  git -C "$MAIN" show-ref --verify --quiet "refs/heads/$1" && return
+  git -C "$MAIN" ls-remote --exit-code --heads origin "$1" >/dev/null 2>&1 || return 0
+  git -C "$MAIN" fetch --quiet origin "$1:$1"
+  git -C "$MAIN" branch --quiet --set-upstream-to "origin/$1" "$1"
+}
+
+cmd_new() {
+  local target=${1:-} base=${2:-main} branch label name prompt json workspace path pane tab server_pane
+  # readline (-e) understands bracketed paste; plain `read` keeps a paste's escape codes
+  [ -n "$target" ] || [ ! -t 0 ] || read -erp "branch, ${TICKET_PREFIX^^}${TICKET_PREFIX:+-1234, }or pr:1234: " target
+  target=${target//$'\e[200~'/}
+  target=${target//$'\e[201~'/}
+  target=${target//[^A-Za-z0-9._\/:#-]/}
+  [ -n "$target" ] || die "usage: wt new <branch|ISSUE-1234|pr:1234> [base]"
+  resolve_target "$target"
+  path=$(worktrees | awk -F'\t' -v b="$branch" '$2 == b { print $1 }')
+  [ -z "$path" ] || die "$branch is already checked out at $path"
+
+  (cmd_gc) >/dev/null || echo "wt: couldn't drop unused databases; run wt gc to see why" >&2
+
+  # Base new branches on an up-to-date main; fetching into main fails when it's checked out
+  if [ "$base" = main ]; then
+    git -C "$MAIN" fetch --quiet origin main:main 2>/dev/null || git -C "$MAIN" fetch --quiet origin main
+  fi
+  fetch_branch "$branch"
+
+  json=$(herdr worktree create --cwd "$MAIN" --branch "$branch" --base "$base" --label "$label" --focus)
+  workspace=$(jq -r '.result.workspace.workspace_id' <<<"$json")
+  path=$(jq -r '.result.workspace.worktree.checkout_path' <<<"$json")
+  pane=$(jq -r '.result.root_pane.pane_id' <<<"$json")
+  tab=$(jq -r '.result.tab.tab_id' <<<"$json")
+
+  herdr tab rename "$tab" code >/dev/null
+  server_pane=$(herdr tab create --workspace "$workspace" --cwd "$path" --label server | jq -r '.result.root_pane.pane_id')
+  herdr pane run "$server_pane" "wt setup && wt serve" >/dev/null
+
+  dev_layout "$pane" "$path" "$name" "$prompt"
+
+  echo "Created $path"
+  echo "Server tab is bootstrapping; the app will be at $(cd "$path" && portless get "$APP")"
+}
+
+next_scratch_name() {
+  local labels n=1
+  labels=$(herdr workspace list | jq -r '.result.workspaces[].label')
+  while grep -qxF "scratch-$n" <<<"$labels"; do n=$((n + 1)); done
+  echo "scratch-$n"
+}
+
+cmd_scratch() {
+  local name json pane tab
+  name=$(next_scratch_name)
+  json=$(herdr workspace create --cwd "$MAIN" --label "$name" --focus)
+  pane=$(jq -r '.result.root_pane.pane_id' <<<"$json")
+  tab=$(jq -r '.result.tab.tab_id' <<<"$json")
+  herdr tab rename "$tab" code >/dev/null
+  dev_layout "$pane" "$MAIN" "$name"
+}
+
+cmd_rm() {
+  local force= branch json path workspace
+  [ "${1:-}" = --force ] && { force=--force; shift; }
+  branch=${1:-}
+  [ -n "$branch" ] || die "usage: wt rm [--force] <branch>"
+
+  json=$(herdr worktree list --cwd "$MAIN")
+  path=$(jq -r --arg b "$branch" '.result.worktrees[] | select(.branch == $b and .is_linked_worktree) | .path' <<<"$json")
+  [ -n "$path" ] || die "no linked worktree for $branch"
+  workspace=$(jq -r --arg b "$branch" '.result.worktrees[] | select(.branch == $b) | .open_workspace_id // empty' <<<"$json")
+
+  # Closing the workspace kills the panes in it, including the one running this script
+  [ -z "$workspace" ] || [ "$workspace" != "${HERDR_WORKSPACE_ID:-}" ] ||
+    die "run wt rm from another workspace, such as the main checkout's"
+
+  # set -e is off when the caller is `cmd_rm || ...`, so a failed removal has to stop us explicitly
+  # before the databases are dropped
+  if [ -n "$workspace" ]; then
+    herdr worktree remove --workspace "$workspace" $force >/dev/null || die "couldn't remove $path"
+  else
+    git -C "$MAIN" worktree remove $force "$path" || die "couldn't remove $path"
+  fi
+
+  cmd_gc
+  echo "Removed $path (branch $branch kept)"
+}
+
+# Why a branch's worktree can go, or nothing when it should stay. A merged PR counts only when the
+# branch has nothing newer than what merged.
+stale_reason() {
+  local branch=$1 prs=$2 pr number state head last_commit idle_days
+  if pr=$(row_for "$branch" "$prs") && [ -n "$pr" ]; then
+    IFS=$'\t' read -r _ number state head <<<"$pr"
+    case $state in
+      MERGED) git -C "$MAIN" merge-base --is-ancestor "$branch" "$head" 2>/dev/null && echo merged ;;
+      CLOSED) echo "PR #$number was closed without merging" ;;
+    esac
+    return 0
+  fi
+  last_commit=$(git -C "$MAIN" log -1 --format=%ct "$branch")
+  idle_days=$((($(date +%s) - last_commit) / 86400))
+  [ "$idle_days" -lt "$IDLE_DAYS" ] || echo "it has no PR and no commits for $idle_days days"
+}
+
+# Reads the answer from the terminal, since prune's stdin is the worktree list
+confirm() {
+  local answer
+  [ -t 2 ] || return 1
+  read -rp "$1 [y/N] " answer </dev/tty || return 1
+  [[ $answer == [yY]* ]]
+}
+
+# gh stack keeps its own record of each stacked branch, so leave those for `gh stack sync` to retire
+in_gh_stack() {
+  grep -qF "\"$1\"" "$(git -C "$MAIN" rev-parse --path-format=absolute --git-common-dir)/gh-stack" 2>/dev/null
+}
+
+delete_branch() {
+  if in_gh_stack "$1"; then
+    echo "Kept branch $1, which gh stack still tracks"
+  else
+    git -C "$MAIN" branch -D --quiet "$1" && echo "Deleted branch $1"
+  fi
+}
+
+# Git refuses to remove any checkout with an initialized submodule (which wt setup always creates)
+# without --force, so check for uncommitted work ourselves and force-remove only clean checkouts
+cmd_prune() {
+  local prs path branch reason
+  cd "$MAIN"
+  prs=$(pr_index)
+  while IFS=$'\t' read -r path branch; do
+    [ -n "$branch" ] && [ "$path" != "$MAIN" ] || continue
+    reason=$(stale_reason "$branch" "$prs")
+    [ -n "$reason" ] || continue
+    if [ -n "$(git -C "$path" status --porcelain --ignore-submodules=none)" ]; then
+      echo "wt: kept $branch, which has uncommitted changes ($reason)" >&2
+      continue
+    fi
+    if [ "$reason" = merged ]; then
+      echo "$branch: its PR merged"
+    else
+      confirm "Remove the $branch worktree? $reason." || continue
+    fi
+    (cmd_rm --force "$branch") || { echo "wt: skipped $branch" >&2; continue; }
+    [ "$reason" != merged ] || delete_branch "$branch"
+  done < <(worktrees)
+
+  while IFS=$'\t' read -r branch path; do
+    [ -z "$path" ] && [ "$branch" != main ] || continue
+    [ "$(stale_reason "$branch" "$prs")" != merged ] || delete_branch "$branch"
+  done < <(git -C "$MAIN" for-each-ref --format='%(refname:short)%09%(worktreepath)' refs/heads)
+
+  cmd_gc
+}
+
+case "${1:-}" in
+  new) shift; cmd_new "$@" ;;
+  setup) cmd_setup ;;
+  serve) cmd_serve ;;
+  open) cmd_open ;;
+  ls) cmd_ls ;;
+  rm) shift; cmd_rm "$@" ;;
+  prune) cmd_prune ;;
+  gc) shift; cmd_gc "$@" ;;
+  snapshot) cmd_snapshot ;;
+  scratch) cmd_scratch ;;
+  layout) cmd_layout ;;
+  review) shift; cmd_review "$@" ;;
+  *) sed -n '2,/^set -euo pipefail/{/^set /!p}' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

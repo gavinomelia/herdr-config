@@ -1,0 +1,187 @@
+onboarding = false
+# Mirrors the Omarchy tmux config in config/tmux/tmux.conf
+# tmux session -> herdr workspace, tmux window -> herdr tab, tmux pane -> herdr pane
+
+[theme]
+# tmux ran on the terminal's own palette (bg=default, fg=default, ANSI blue accents)
+name = "terminal"
+
+[theme.custom]
+# The active tab is drawn as panel_bg text on an accent background, so panel_bg
+# has to be dark for it to read - same colors as status-left's "#[fg=black,bg=blue]"
+panel_bg = "reset"
+surface_dim = "black"
+
+[terminal]
+# Matches -c "#{pane_current_path}" on every split, window, and session
+new_cwd = "follow"
+
+[keys]
+prefix = "alt+space"
+
+# Config and help
+reload_config = "prefix+q"
+help = "prefix+?"
+detach = "prefix+d"
+
+# Copy mode
+copy_mode = "prefix+["
+
+# Panes
+split_horizontal = ["prefix+h", "alt+enter"]
+split_vertical = ["prefix+v", "alt+shift+enter"]
+close_pane = ["prefix+x", "alt+esc"]
+zoom = ["prefix+z", "alt+z"]
+last_pane = "prefix+;"
+
+focus_pane_left = ["alt+h", "ctrl+alt+left"]
+focus_pane_down = ["alt+j", "ctrl+alt+down"]
+focus_pane_up = ["alt+k", "ctrl+alt+up"]
+focus_pane_right = ["alt+l", "ctrl+alt+right"]
+
+resize_mode = ["prefix+ctrl+left", "prefix+ctrl+down", "prefix+ctrl+up", "prefix+ctrl+right"]
+
+# Like resize-pane on C-M-S-arrows
+resize_pane_left = "ctrl+alt+shift+left"
+resize_pane_down = "ctrl+alt+shift+down"
+resize_pane_up = "ctrl+alt+shift+up"
+resize_pane_right = "ctrl+alt+shift+right"
+
+# No tmux equivalent; herdr's default prefix+shift+p is taken by previous session
+rename_pane = "prefix+shift+o"
+
+# Windows -> tabs
+new_tab = "prefix+c"
+rename_tab = "prefix+r"
+close_tab = "prefix+k"
+switch_tab = ["prefix+1..9", "alt+1..9"]
+previous_tab = ["prefix+p", "alt+left"]
+next_tab = ["prefix+n", "alt+right"]
+
+# Like swap-window -t -1/+1 on M-S-Left/Right
+move_tab_previous = "alt+shift+left"
+move_tab_next = "alt+shift+right"
+
+# Sessions -> workspaces
+new_workspace = "prefix+shift+c"
+rename_workspace = "prefix+shift+r"
+close_workspace = "prefix+shift+k"
+previous_workspace = ["prefix+shift+p", "alt+up"]
+next_workspace = ["prefix+shift+n", "alt+down"]
+
+[ui]
+accent = "blue"
+
+# Worktree rows lose about 12 columns to the tree indent, and ticket titles need the rest
+sidebar_width = 44
+sidebar_max_width = 44
+
+# tmux drew single-line dividers between adjacent panes and no outer frame
+pane_gaps = false
+pane_outer_borders = false
+
+# tmux had no scrollbar column beside its panes
+pane_scrollbars = false
+
+# kill-window and kill-session never asked
+confirm_close = false
+
+# automatic-rename gave windows a name without prompting
+prompt_new_tab_name = false
+
+# set -g mouse on
+mouse_capture = true
+
+# status-right had the zoom flag followed by #h
+tab_bar_right = [{ type = "zoom" }, { type = "hostname" }]
+
+# set -g set-titles on / set -g set-titles-string '#h:#W', where tmux's #W was
+# the basename of the pane cwd. This is what Hyprland shows in the group bar,
+# and it resolves on the server so remote sessions name the remote host.
+window_title = "{hostname}: {workspace}"
+
+# The tab moves to the second line so the ticket title gets the whole first line
+[ui.sidebar.agents]
+rows = [["state_icon", "machine", "workspace"], ["agent", "tab"]]
+
+# herdr hides popups for the tab in view and can't reach you outside the terminal, so
+# "blocked" and "done" go to the desktop notification daemon; clicking one jumps to the pane
+[ui.toast]
+delivery = "system"
+
+[worktrees]
+# Worktrees land in <directory>/<repo>/<branch>
+directory = "~/Work/worktrees"
+
+# Worktree helpers from bin/wt in this repo, which must be on your PATH
+# alt+t takes a branch, a Linear issue (ABC-1234), or a PR (pr:1234)
+[[keys.command]]
+key = "alt+t"
+type = "popup"
+description = "new ticket worktree (wt new)"
+command = 'wt new || read -rsn1 -p "press any key"'
+width = "70%"
+height = "40%"
+
+[[keys.command]]
+key = "alt+o"
+type = "shell"
+description = "open this checkout in the browser (wt open)"
+command = "wt open"
+
+[[keys.command]]
+key = "alt+shift+o"
+type = "popup"
+description = "list running dev servers (portless list)"
+command = 'portless list; read -rsn1 -p "press any key"'
+width = "80%"
+height = "50%"
+
+# Opens in the focused pane's checkout, so it follows whichever worktree you're in
+[[keys.command]]
+key = "alt+g"
+type = "popup"
+description = "lazygit for this checkout"
+command = "lazygit"
+width = "90%"
+height = "90%"
+
+# Same as alt+t, with Codex in place of Claude for when Claude's usage runs out
+[[keys.command]]
+key = "alt+shift+t"
+type = "popup"
+description = "new ticket worktree with Codex (WT_AGENT=codex wt new)"
+command = 'WT_AGENT=codex wt new || read -rsn1 -p "press any key"'
+width = "70%"
+height = "40%"
+
+# Opens beside the focused pane, in its checkout
+[[keys.command]]
+key = "alt+r"
+type = "shell"
+description = "Codex reviews this branch against main (wt review)"
+command = "wt review"
+
+[[keys.command]]
+key = "alt+w"
+type = "popup"
+description = "every worktree with its PR, CI, and changes (wt ls)"
+command = 'wt ls; read -rsn1 -p "press any key"'
+width = "90%"
+height = "50%"
+
+# Asks before removing worktrees that were abandoned rather than merged
+[[keys.command]]
+key = "alt+shift+w"
+type = "popup"
+description = "remove merged and abandoned worktrees (wt prune)"
+command = 'wt prune; read -rsn1 -p "press any key"'
+width = "80%"
+height = "50%"
+
+# Branchless session on the main checkout for questions and one-off changes
+[[keys.command]]
+key = "alt+s"
+type = "shell"
+description = "scratch workspace on the main checkout (wt scratch)"
+command = "wt scratch"
