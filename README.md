@@ -15,6 +15,8 @@ My [herdr](https://herdr.dev) setup for running several coding agents at once, e
 
 For a Linear issue the agent starts by reading the issue. For a PR it starts by reading the PR.
 
+If the branch already has a worktree, `wt new` switches to its workspace. If the worktree has no open workspace, it opens one, and Claude continues its last conversation in that checkout.
+
 `wt setup` gives the worktree:
 
 - its own dev database, cloned from the main one (near instant on btrfs);

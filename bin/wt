@@ -6,7 +6,9 @@
 #                           "server" tab that runs `wt setup` and then `wt serve`. The target is a
 #                           branch name, a Linear issue (ABC-1234: its branch, and the agent starts by
 #                           reading the issue), or a PR (pr:1234: its branch, and the agent starts by
-#                           reading the PR)
+#                           reading the PR). A branch that already has a worktree gets its open
+#                           workspace focused, or a new one in which Claude continues its last
+#                           conversation there
 #   wt setup                Bootstrap the checkout you're in (one made from herdr's sidebar, too)
 #   wt serve                Run the app at its portless URL (works in the main checkout too)
 #   wt open                 Open this checkout's URL in the browser
@@ -252,12 +254,13 @@ workspace_label() {
 # Omarchy's `hdl cx` with the sides flipped: the agent left (70%), editor right (30%),
 # terminal along the bottom (15%)
 dev_layout() {
-  local ai_pane=$1 dir=$2 name=$3 prompt=${4:-} editor_pane
+  local ai_pane=$1 dir=$2 name=$3 editor_pane
+  shift 3
   herdr pane split "$ai_pane" --direction down --ratio 0.85 --cwd "$dir" --no-focus >/dev/null
   editor_pane=$(herdr pane split "$ai_pane" --direction right --ratio 0.7 --cwd "$dir" --no-focus |
     jq -r '.result.pane.pane_id')
   herdr pane run "$editor_pane" "$EDITOR_COMMAND" >/dev/null
-  start_agent "$name" "$AGENT" "$ai_pane" ${prompt:+"$prompt"}
+  start_agent "$name" "$AGENT" "$ai_pane" "$@"
 }
 
 # Returns agent_not_ready while the agent asks whether to trust the new folder; that's expected
@@ -326,7 +329,7 @@ fetch_branch() {
 }
 
 cmd_new() {
-  local target=${1:-} base=${2:-main} branch label name prompt json workspace path pane tab server_pane
+  local target=${1:-} base=${2:-main} branch label name prompt existing json workspace path linked
   # readline (-e) understands bracketed paste; plain `read` keeps a paste's escape codes
   [ -n "$target" ] || [ ! -t 0 ] || read -erp "branch, ${TICKET_PREFIX^^}${TICKET_PREFIX:+-1234, }or pr:1234: " target
   target=${target//$'\e[200~'/}
@@ -334,8 +337,22 @@ cmd_new() {
   target=${target//[^A-Za-z0-9._\/:#-]/}
   [ -n "$target" ] || die "usage: wt new <branch|ISSUE-1234|pr:1234> [base]"
   resolve_target "$target"
-  path=$(worktrees | awk -F'\t' -v b="$branch" '$2 == b { print $1 }')
-  [ -z "$path" ] || die "$branch is already checked out at $path"
+
+  existing=$(herdr worktree list --cwd "$MAIN" | jq -r --arg b "$branch" \
+    '.result.worktrees[] | select(.branch == $b) | [.path, (.open_workspace_id // "-"), .is_linked_worktree] | @tsv')
+  if [ -n "$existing" ]; then
+    IFS=$'\t' read -r path workspace linked <<<"$existing"
+    [ "$linked" = true ] || die "$branch is checked out in the main checkout; switch that to another branch first"
+    if [ "$workspace" != - ]; then
+      herdr workspace focus "$workspace" >/dev/null
+      echo "Switched to $branch's workspace"
+      return
+    fi
+    json=$(herdr worktree open --cwd "$MAIN" --path "$path" --label "$label" --focus)
+    open_workspace "$json" "$name" $(resume_args "$path")
+    echo "Reopened $path"
+    return
+  fi
 
   (cmd_gc) >/dev/null || echo "wt: couldn't drop unused databases; run wt gc to see why" >&2
 
@@ -346,19 +363,35 @@ cmd_new() {
   fetch_branch "$branch"
 
   json=$(herdr worktree create --cwd "$MAIN" --branch "$branch" --base "$base" --label "$label" --focus)
+  open_workspace "$json" "$name" ${prompt:+"$prompt"}
+  echo "Created $(jq -r '.result.workspace.worktree.checkout_path' <<<"$json")"
+}
+
+# Claude keeps a checkout's conversations under its path with every other character turned into
+# "-", so a checkout that had one picks up where it left off
+resume_args() {
+  local sessions=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/${1//[^A-Za-z0-9]/-}
+  [ "$AGENT" = claude ] && compgen -G "$sessions/*.jsonl" >/dev/null && echo --continue
+  return 0
+}
+
+# Fills a workspace that `herdr worktree create` or `open` just made: the code layout, and a server
+# tab that sets the checkout up first unless that already happened
+open_workspace() {
+  local json=$1 name=$2 workspace path pane tab server_pane serve="wt serve"
+  shift 2
   workspace=$(jq -r '.result.workspace.workspace_id' <<<"$json")
   path=$(jq -r '.result.workspace.worktree.checkout_path' <<<"$json")
   pane=$(jq -r '.result.root_pane.pane_id' <<<"$json")
   tab=$(jq -r '.result.tab.tab_id' <<<"$json")
 
   herdr tab rename "$tab" code >/dev/null
+  [ -f "$path/.env_overrides.rb" ] || serve="wt setup && wt serve"
   server_pane=$(herdr tab create --workspace "$workspace" --cwd "$path" --label server | jq -r '.result.root_pane.pane_id')
-  herdr pane run "$server_pane" "wt setup && wt serve" >/dev/null
+  herdr pane run "$server_pane" "$serve" >/dev/null
 
-  dev_layout "$pane" "$path" "$name" "$prompt"
-
-  echo "Created $path"
-  echo "Server tab is bootstrapping; the app will be at $(cd "$path" && portless get "$APP")"
+  dev_layout "$pane" "$path" "$name" "$@"
+  echo "The app will be at $(cd "$path" && portless get "$APP")"
 }
 
 next_scratch_name() {
